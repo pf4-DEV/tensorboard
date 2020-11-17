@@ -60,14 +60,26 @@ ng_module(
 )
 
 tf_ts_library(
+    name = "line_chart_utils",
+    srcs = [
+        "data_transformer.ts",
+    ],
+    deps = [
+        "//tensorboard/webapp/widgets/line_chart_v2/lib:public_types",
+    ],
+)
+
+tf_ts_library(
     name = "line_chart_v2_tests",
     testonly = True,
     srcs = [
+        "data_transformer_test.ts",
         "line_chart_component_test.ts",
         "line_chart_internal_utils_test.ts",
     ],
     deps = [
         ":internal_utils",
+        ":line_chart_utils",
         ":line_chart_v2",
         "//tensorboard/webapp/angular:expect_angular_cdk_overlay",
         "//tensorboard/webapp/angular:expect_angular_core_testing",
