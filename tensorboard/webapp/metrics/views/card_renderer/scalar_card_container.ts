@@ -21,14 +21,14 @@ import {
   Output,
 } from '@angular/core';
 import {Store} from '@ngrx/store';
-import {DataLoadState} from '../../../types/data';
-import {combineLatest, Observable, of} from 'rxjs';
+import {combineLatest, from, Observable, of} from 'rxjs';
 import {
   combineLatestWith,
   debounceTime,
   distinctUntilChanged,
   filter,
   map,
+  shareReplay,
   startWith,
   switchMap,
 } from 'rxjs/operators';
@@ -39,9 +39,17 @@ import {
   getCurrentRouteRunSelection,
   getExperimentIdForRunId,
   getExperimentIdToAliasMap,
+  getIsGpuChartEnabled,
   getRun,
+  getRunColorMap,
 } from '../../../selectors';
+import {DataLoadState} from '../../../types/data';
 import {RunColorScale} from '../../../types/ui';
+import {classicSmoothing} from '../../../widgets/line_chart_v2/data_transformer';
+import {
+  DataSeries,
+  DataSeriesMetadataMap,
+} from '../../../widgets/line_chart_v2/types';
 import {PluginType, ScalarStepDatum} from '../../data_source';
 import {
   getCardLoadState,
@@ -56,8 +64,13 @@ import {
 import {CardId, CardMetadata, XAxisType} from '../../types';
 import {CardRenderer} from '../metrics_view_types';
 import {getTagDisplayName} from '../utils';
-
 import {SeriesDataList, SeriesPoint} from './scalar_card_component';
+import {
+  ScalarCardDataSeries,
+  ScalarCardPoint,
+  ScalarCardSeriesMetadata,
+  ScalarCardSeriesMetadataMap,
+} from './scalar_card_types';
 import {getDisplayNameForRun} from './utils';
 
 type ScalarCardMetadata = CardMetadata & {
@@ -88,6 +101,25 @@ function areSeriesDataListEqual(
   });
 }
 
+function areSeriesEqual<T extends DataSeries>(listA: T[], listB: T[]): boolean {
+  if (listA.length !== listB.length) {
+    return false;
+  }
+  return listA.every((listAVal, index) => {
+    const listBVal = listB[index];
+    const listAPoints = listAVal.points;
+    const listBPoints = listBVal.points;
+    return (
+      listAVal.id === listBVal.id &&
+      listAPoints.length === listBPoints.length &&
+      listAPoints.every((listAPoint, index) => {
+        const listBPoint = listBPoints[index];
+        return listAPoint.x === listBPoint.x && listAPoint.y === listBPoint.y;
+      })
+    );
+  });
+}
+
 @Component({
   selector: 'scalar-card',
   template: `
@@ -103,6 +135,11 @@ function areSeriesDataListEqual(
       [scalarSmoothing]="scalarSmoothing$ | async"
       [showFullSize]="showFullSize"
       [isPinned]="isPinned$ | async"
+      [dataSeries]="(gpuLineChartEnabled$ | async) ? (dataSeries$ | async) : []"
+      [chartMetadataMap]="
+        (gpuLineChartEnabled$ | async) ? (chartMetadataMap$ | async) : {}
+      "
+      [gpuLineChartEnabled]="gpuLineChartEnabled$ | async"
       (onFullSizeToggle)="onFullSizeToggle()"
       (onPinClicked)="pinStateChanged.emit($event)"
     ></scalar-card-component>
@@ -132,10 +169,15 @@ export class ScalarCardContainer implements CardRenderer, OnInit {
   tag$?: Observable<string>;
   seriesDataList$?: Observable<SeriesDataList> = of([]);
   isPinned$?: Observable<boolean>;
+  dataSeries$?: Observable<ScalarCardDataSeries[]>;
+  chartMetadataMap$?: Observable<ScalarCardSeriesMetadataMap>;
+
   readonly tooltipSort$ = this.store.select(getMetricsTooltipSort);
   readonly ignoreOutliers$ = this.store.select(getMetricsIgnoreOutliers);
   readonly xAxisType$ = this.store.select(getMetricsXAxisType);
   readonly scalarSmoothing$ = this.store.select(getMetricsScalarSmoothing);
+  readonly gpuLineChartEnabled$ = this.store.select(getIsGpuChartEnabled);
+
   showFullSize = false;
 
   private isScalarCardMetadata(
@@ -187,7 +229,8 @@ export class ScalarCardContainer implements CardRenderer, OnInit {
           };
         });
         return results;
-      })
+      }),
+      shareReplay(1)
     );
 
     this.seriesDataList$ = runIdAndPoints$.pipe(
@@ -220,6 +263,106 @@ export class ScalarCardContainer implements CardRenderer, OnInit {
       }),
       startWith([]),
       distinctUntilChanged(areSeriesDataListEqual)
+    );
+
+    function getSmoothedSeriesId(seriesId: string): string {
+      return JSON.stringify(['smoothed', seriesId]);
+    }
+
+    this.dataSeries$ = runIdAndPoints$.pipe(
+      combineLatestWith(this.store.select(getMetricsScalarSmoothing)),
+      switchMap(([runsData, smoothing]) => {
+        const dataSeriesList = runsData.map(({runId, points}) => {
+          return {id: runId, points};
+        });
+        if (smoothing === 0) {
+          return of(dataSeriesList);
+        }
+        return from(classicSmoothing(dataSeriesList, smoothing)).pipe(
+          map((smoothedDataSeriesList) => {
+            const dataSeriesMap = new Map(
+              dataSeriesList.map((datum) => [datum.id, datum])
+            );
+            for (const smoothedSeries of smoothedDataSeriesList) {
+              const {points: origPoints} = dataSeriesMap.get(
+                smoothedSeries.id
+              )!;
+              dataSeriesList.push({
+                id: getSmoothedSeriesId(smoothedSeries.id),
+                points: smoothedSeries.points.map(({y}, index) => {
+                  return {...origPoints[index], y};
+                }),
+              });
+            }
+            return dataSeriesList;
+          })
+        );
+      }),
+      distinctUntilChanged(areSeriesEqual),
+      startWith([])
+    );
+
+    this.chartMetadataMap$ = runIdAndPoints$.pipe(
+      switchMap((runIdAndPoints) => {
+        if (!runIdAndPoints.length) {
+          return of([]);
+        }
+
+        return combineLatest(
+          runIdAndPoints.map((runIdAndPoint) => {
+            return this.getRunDisplayNameAndPoints(runIdAndPoint);
+          })
+        );
+      }),
+      combineLatestWith(
+        this.store.select(getCurrentRouteRunSelection),
+        this.store.select(getRunColorMap),
+        this.store.select(getMetricsScalarSmoothing)
+      ),
+      // When the `fetchRunsSucceeded` action fires, the run selection
+      // map and the metadata change. To prevent quick fire of changes,
+      // debounce by a microtask to emit only single change for the runs
+      // store change.
+      debounceTime(0),
+      map(([displayNameAndPoints, runSelectionMap, colorMap, smoothing]) => {
+        const metadataMap: ScalarCardSeriesMetadataMap = {};
+        const shouldSmooth = smoothing > 0;
+
+        for (const {displayName, runId} of displayNameAndPoints) {
+          metadataMap[runId] = {
+            id: runId,
+            displayName,
+            visible: Boolean(runSelectionMap && runSelectionMap.get(runId)),
+            color: colorMap[runId] ?? '#fff',
+            aux: false,
+            opacity: 1,
+            smoothOf: null,
+            smoothedBy: null,
+          };
+        }
+
+        if (!shouldSmooth) {
+          return metadataMap;
+        }
+
+        for (const [id, metadata] of Object.entries(metadataMap)) {
+          const smoothedSeriesId = getSmoothedSeriesId(id);
+          metadataMap[smoothedSeriesId] = {
+            ...metadata,
+            id: smoothedSeriesId,
+            aux: false,
+            smoothOf: id,
+            smoothedBy: null,
+            opacity: 1,
+          };
+
+          metadata.aux = true;
+          metadata.opacity = 0.4;
+          metadata.smoothedBy = smoothedSeriesId;
+        }
+        return metadataMap;
+      }),
+      startWith({})
     );
 
     this.loadState$ = this.store.select(getCardLoadState, this.cardId);
@@ -263,7 +406,7 @@ export class ScalarCardContainer implements CardRenderer, OnInit {
   private stepSeriesToLineSeries(
     stepSeries: ScalarStepDatum[],
     xAxisType: XAxisType
-  ) {
+  ): ScalarCardPoint[] {
     const isStepBased = xAxisType === XAxisType.STEP;
     return stepSeries.map((stepDatum) => {
       return {
