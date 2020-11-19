@@ -15,6 +15,7 @@ ng_module(
     srcs = [
         "line_chart_component.ts",
         "line_chart_module.ts",
+        "types.ts",
     ],
     assets = [
         "line_chart_component.ng.html",
